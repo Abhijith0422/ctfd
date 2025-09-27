@@ -8,6 +8,7 @@ from homecooked.exceptions.httpexceptions import (
     BadRequest
 )
 
+from homecooked.waf.waf import HomecookedWAF
 from homecooked.request import Request
 from homecooked.response import Response, TemplateResponse
 from homecooked.constants import HTTPMethods
@@ -22,6 +23,7 @@ class App:
         self.router = Router(self.config.static_dir)
         self.exception_handler = ExceptionHandler()
         self.template_manager = MealManager(self.config.template_dir)
+        self.waf = HomecookedWAF()
 
     async def read_body(self, receive):
         body = b""
@@ -43,38 +45,44 @@ class App:
             response = Response(b"", status_code=413)
             await response.write(send, HTTPMethods.HEAD)
             return
-
+        
         request = Request(scope, body)
+
+        if not await self.waf.check_request(request):
+            response = Response(b"Homecooked WAF blocked request", status=403)
+            await response.write(send, request.method == HTTPMethods.HEAD)
+            return
 
         path_type, path, request.params = self.router.get_path(request.path, request.method)
         call_stack = self.router.get_middlewares(request.path)
 
-        if path_type in (PathTypes.STATIC, PathTypes.DYNAMIC):
-            if request.method in {HTTPMethods.POST, HTTPMethods.PATCH, HTTPMethods.PUT} and path.model is not None:
-                try:
-                    request.model = path.model.model_validate_json(request.body)
+        match path_type:
+            case PathTypes.STATIC | PathTypes.DYNAMIC:
+                if request.method in {HTTPMethods.POST, HTTPMethods.PATCH, HTTPMethods.PUT} and path.model is not None:
+                    try:
+                        request.model = path.model.model_validate_json(request.body)
+                        call_stack.append(path)
+                    except ValidationError as e:
+                        call_stack = self.exception_handler.get_handler(BadRequest())
+                else:
                     call_stack.append(path)
-                except ValidationError as e:
-                    call_stack = self.exception_handler.get_handler(BadRequest())
-            else:
-                call_stack.append(path)
-            try:
-                response = await call_stack(request)
-            except HTTPException as e:
-                handler = self.exception_handler.get_handler(e)
+                try:
+                    response = await call_stack(request)
+                except HTTPException as e:
+                    handler = self.exception_handler.get_handler(e)
+                    response = await handler(request)
+            case PathTypes.FILE:
+                (mime_type, encoding), body = path, request.params
+                response = Response(body, mime_type=mime_type, encoding=encoding)
+            case PathTypes.NOPATH:
+                handler = self.exception_handler.get_handler(NotFound())
                 response = await handler(request)
-        elif path_type == PathTypes.FILE:
-            (mime_type, encoding), body = path, request.params
-            response = Response(body, mime_type=mime_type, encoding=encoding)
-        elif path_type == PathTypes.NOPATH:
-            handler = self.exception_handler.get_handler(NotFound())
-            response = await handler(request)
-        elif path_type == PathTypes.NOMETHOD:
-            handler = self.exception_handler.get_handler(MethodNotAllowed())
-            response = await handler(request)
-        else:
-            handler = self.exception_handler.get_handler(ServerError())
-            response = await handler(request)
+            case PathTypes.NOMETHOD:
+                handler = self.exception_handler.get_handler(MethodNotAllowed())
+                response = await handler(request)
+            case _:
+                handler = self.exception_handler.get_handler(ServerError())
+                response = await handler(request)
 
         if isinstance(response, TemplateResponse):
             await response.write(send, self.template_manager, request.method == HTTPMethods.HEAD)
@@ -92,13 +100,11 @@ class App:
     def add_subrouter(self, path : str, subrouter : SubRouter):
         path = path.rstrip("/").lstrip("/")
         for sr_path, handler, method in subrouter.paths:
-            clean_sr_path = sr_path.rstrip("/").lstrip("/")
-            joined_path = f"{path}/{clean_sr_path}"
+            joined_path = f"{path}/{sr_path.rstrip("/").lstrip("/")}"
             self.add_path(joined_path, handler, method)
         
         for sr_path, middleware in subrouter.middlewares:
-            clean_sr_path = sr_path.rstrip("/").lstrip("/")
-            joined_path = f"{path}/{clean_sr_path}"
+            joined_path = f"{path}/{sr_path.rstrip("/").lstrip("/")}"
             self.router.add_middleware(middleware, sr_path)
 
     def route(self, path, methods = None):
